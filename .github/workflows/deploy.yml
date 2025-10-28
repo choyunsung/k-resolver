@@ -1,0 +1,305 @@
+name: Build and Deploy K-Resolver
+
+on:
+  push:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deploy'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: docker.quetta-soft.com
+  IMAGE: docker.quetta-soft.com/yunsung/k-resolver
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build-and-push:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Registry (with retry)
+        run: |
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS to login to Docker registry..."
+
+            if echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ${{ env.REGISTRY }} \
+              --username "${{ secrets.DOCKER_USERNAME }}" \
+              --password-stdin; then
+              echo "Successfully logged in to Docker registry"
+              break
+            else
+              echo "Login attempt $ATTEMPT failed"
+              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                echo "Waiting 10 seconds before retry..."
+                sleep 10
+              else
+                echo "All login attempts failed"
+                exit 1
+              fi
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+      - name: Compute tags
+        id: tags
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SHA7="${{ github.sha }}"
+          SHORT="${SHA7:0:7}"
+
+          if [[ "${BRANCH}" == "main" ]]; then
+            echo "TAGS=${{ env.IMAGE }}:${SHORT},${{ env.IMAGE }}:latest" >> "$GITHUB_ENV"
+          else
+            SAFE_BRANCH="${BRANCH//\//-}"
+            echo "TAGS=${{ env.IMAGE }}:${SAFE_BRANCH}-${SHORT}" >> "$GITHUB_ENV"
+          fi
+          echo "Using tags: $TAGS"
+
+      - name: Build and push multi-platform Docker image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          set -euo pipefail
+
+          # Dockerfile 확인
+          if [ ! -f "Containerfile" ]; then
+            echo "Error: Containerfile not found"
+            exit 1
+          fi
+
+          # 태그 배열로 변환
+          IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
+
+          # buildx를 사용하여 멀티플랫폼 이미지 빌드 및 푸시
+          BUILD_CMD="docker buildx build --platform ${{ env.PLATFORMS }} --push -f Containerfile"
+
+          # 각 태그 추가
+          for tag in "${TAG_ARRAY[@]}"; do
+            BUILD_CMD="$BUILD_CMD -t $tag"
+          done
+
+          BUILD_CMD="$BUILD_CMD ."
+
+          echo "Building with command: $BUILD_CMD"
+          eval $BUILD_CMD
+
+  deploy-to-server:
+    name: Deploy to server
+    needs: build-and-push
+    runs-on: [self-hosted, k-resolver]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create deployment directory
+        run: |
+          mkdir -p /data/k-resolver
+
+      - name: Copy compose file
+        run: |
+          cp compose.yml /data/k-resolver/
+          cp .env.example /data/k-resolver/.env.example
+
+          # .env 파일이 없으면 example로 생성
+          if [ ! -f /data/k-resolver/.env ]; then
+            cp .env.example /data/k-resolver/.env
+            echo "⚠️  .env 파일이 생성되었습니다. 설정을 확인하세요."
+          fi
+
+      - name: Pull and restart containers
+        run: |
+          cd /data/k-resolver
+
+          # 이미지 풀
+          podman-compose pull api || docker-compose pull api
+
+          # 컨테이너 재시작
+          podman-compose up -d || docker-compose up -d
+
+          # 헬스체크 대기
+          echo "Waiting for service to be healthy..."
+          sleep 10
+
+          # 서비스 상태 확인
+          curl -f http://localhost:8000/health || echo "⚠️  Health check failed"
+
+      - name: Run database migrations
+        run: |
+          cd /data/k-resolver
+
+          # 마이그레이션 실행
+          podman-compose exec -T api alembic upgrade head || \
+          docker-compose exec -T api alembic upgrade head
+
+          echo "✅ Database migrations completed"
+
+      - name: Seed data if needed
+        run: |
+          cd /data/k-resolver
+
+          # 데이터가 없으면 시드 실행 (선택사항)
+          echo "Run 'podman-compose exec api python scripts/seed_data.py' manually if needed"
+
+  notify-success:
+    name: Notify deployment success
+    needs: [build-and-push, deploy-to-server]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send success notification to Slack
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "✅ K-Resolver 배포 성공!",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚀 K-Resolver 배포 성공",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*프로젝트:*\nK-Resolver"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*브랜치:*\n`${{ github.ref_name }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*커밋:*\n`${{ github.sha }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*배포자:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*커밋 메시지:*\n${{ github.event.head_commit.message }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "GitHub Actions 보기",
+                        "emoji": true
+                      },
+                      "url": "${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "커밋 보기",
+                        "emoji": true
+                      },
+                      "url": "${{ github.event.repository.html_url }}/commit/${{ github.sha }}"
+                    }
+                  ]
+                }
+              ]
+            }'
+
+  notify-failure:
+    name: Notify deployment failure
+    needs: [build-and-push, deploy-to-server]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send failure notification to Slack
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "❌ K-Resolver 배포 실패!",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "⚠️ K-Resolver 배포 실패",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*프로젝트:*\nK-Resolver"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*브랜치:*\n`${{ github.ref_name }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*커밋:*\n`${{ github.sha }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🔴 *즉시 확인이 필요합니다!*"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "🔍 로그 확인",
+                        "emoji": true
+                      },
+                      "style": "danger",
+                      "url": "${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }'
